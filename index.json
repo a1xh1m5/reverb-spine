@@ -1,0 +1,16 @@
+{
+  "category:modules": [ 
+	  {
+      "id": "reverb",
+      "name": "reverb",
+      "download": "reverb.8spine",
+      "version": "v1.0.0",
+      "type": "MODULE",
+      "author": "xander12",
+      "description": "Tidal module w/ Dolby Support",
+      "tags": ["HI-RES", "DOBLY ATMOS", "TIDAL", "APPLE MUSIC"],
+      "featured": true,
+      "trusted": true
+    }
+  ]
+}
