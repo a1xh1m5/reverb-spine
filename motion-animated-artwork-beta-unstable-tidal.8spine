@@ -1,180 +1,202 @@
-// MOTION — TIDAL Animated Artwork for 8SPINE
-// Standalone artwork module. Does not contain or modify Lumen source.
-// v1.0.0 — TIDAL only
+// Motion — TIDAL animated artwork module for 8SPINE
+// Resolves the current track ISRC to a TIDAL track, reads videoCover from
+// /info/, and returns the TIDAL MP4 proxy URL expected by the artwork player.
+// Independent implementation; does not contain Lumen source code.
 
-const MODULE_VERSION = '1.0.0';
-const TIDAL_API = 'https://tidal.alx12.dpdns.org';
-const ISRC_API = 'https://isrc.xander12.workers.dev';
-
-const POSITIVE_TTL = 6 * 60 * 60 * 1000;
-const NEGATIVE_TTL = 30 * 60 * 1000;
-const MAX_CACHE_SIZE = 250;
-
-const cache = new Map();
-const pending = new Map();
+var MODULE_VERSION = '1.0.1';
+var ISRC_RESOLVER_BASE = 'https://isrc.xander12.workers.dev';
+var TIDAL_API_BASE = 'https://tidal.alx12.dpdns.org';
+var TIDAL_VIDEO_BASE = 'https://tidal.com';
+var CACHE_TTL_MS = 30 *  60 * 1000;
+var MISS_TTL_MS = 2 * 60 * 1000;
+var CACHE_MAX = 250;
+var artworkCache = new Map();
+var pendingRequests = new Map();
 
 function normalizeIsrc(value) {
-  const candidate = String(value || '').trim().toUpperCase();
+  var candidate = String(value == null ? '' : value).trim().toUpperCase();
+  candidate = candidate.replace(/^ISRC:/, '').replace(/\s+/g, '');
   return /^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(candidate) ? candidate : null;
 }
 
-function findIsrc(value, depth) {
-  if (!value || typeof value !== 'object' || depth > 5) return null;
+function isObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
 
-  const direct = normalizeIsrc(
-    value.isrc || value.ISRC || value.isrcCode ||
-    (value.externalIds && value.externalIds.isrc)
-  );
-  if (direct) return direct;
-
-  const keys = ['track', 'metadata', 'item', 'context', 'currentTrack', 'nowPlaying', 'mediaItem'];
-  for (const key of keys) {
-    const found = findIsrc(value[key], depth + 1);
-    if (found) return found;
+function getContextTrack(context) {
+  if (!isObject(context)) return null;
+  var candidates = [context.track, context.metadata, context.item, context.currentTrack];
+  for (var i = 0; i < candidates.length; i++) {
+    if (isObject(candidates[i])) return candidates[i];
   }
   return null;
 }
 
-function contextIsrc(args) {
-  for (const arg of args) {
-    const found = findIsrc(arg, 0);
-    if (found) return found;
+// 8SPINE may supply the ISRC as the first argument or in its track context.
+// Check all positional arguments so harmless signature differences do not
+// prevent the module from resolving the active track.
+function extractIsrc(args) {
+  for (var i = 0; i < args.length; i++) {
+    var value = args[i];
+    if (typeof value === 'string') {
+      var direct = normalizeIsrc(value);
+      if (direct) return direct;
+    }
+    if (isObject(value)) {
+      var fields = [value.isrc, value.ISRC, value.isrcCode];
+      for (var j = 0; j < fields.length; j++) {
+        var fromObject = normalizeIsrc(fields[j]);
+        if (fromObject) return fromObject;
+      }
+      var nested = getContextTrack(value);
+      if (nested) {
+        var fromNested = normalizeIsrc(nested.isrc || nested.ISRC || nested.isrcCode);
+        if (fromNested) return fromNested;
+      }
+    }
   }
   return null;
 }
 
-function readCache(key) {
-  const entry = cache.get(key);
+function cacheGet(key) {
+  var entry = artworkCache.get(key);
   if (!entry) return undefined;
   if (entry.expiresAt <= Date.now()) {
-    cache.delete(key);
+    artworkCache.delete(key);
     return undefined;
   }
-  cache.delete(key);
-  cache.set(key, entry);
+  artworkCache.delete(key);
+  artworkCache.set(key, entry);
   return entry.value;
 }
 
-function writeCache(key, value, ttl) {
-  cache.delete(key);
-  cache.set(key, { value: value, expiresAt: Date.now() + ttl });
-  while (cache.size > MAX_CACHE_SIZE) cache.delete(cache.keys().next().value);
+function cacheSet(key, value, ttl) {
+  artworkCache.delete(key);
+  artworkCache.set(key, { value: value, expiresAt: Date.now() + ttl });
+  while (artworkCache.size > CACHE_MAX) {
+    artworkCache.delete(artworkCache.keys().next().value);
+  }
   return value;
 }
 
 async function getJson(url, label) {
-  const response = await fetch(url, {
+  var response = await fetch(url, {
     method: 'GET',
-    headers: { Accept: 'application/json', 'User-Agent': 'motion/' + MODULE_VERSION }
+    headers: { Accept: 'application/json' }
   });
-  if (!response.ok) throw new Error(label + ' failed: HTTP ' + response.status);
+  if (!response.ok) {
+    throw new Error(label + ' failed with HTTP ' + response.status);
+  }
   return response.json();
 }
 
-async function resolveTidalId(isrc) {
-  const key = 'isrc:' + isrc;
-  const cached = readCache(key);
-  if (cached !== undefined) return cached;
-  if (pending.has(key)) return pending.get(key);
+async function resolveTidalTrackId(isrc) {
+  var payload = await getJson(
+    ISRC_RESOLVER_BASE + '/resolve/' + encodeURIComponent(isrc),
+    'ISRC resolver'
+  );
+  if (!payload || payload.success !== true) {
+    throw new Error('ISRC resolver did not confirm a match');
+  }
 
-  const task = (async function () {
-    try {
-      const payload = await getJson(ISRC_API + '/resolve/' + encodeURIComponent(isrc), 'ISRC resolver');
-      const matches = payload && payload.success === true && payload.tidal &&
-        payload.tidal.status === 'found' && Array.isArray(payload.tidal.matches)
-        ? payload.tidal.matches : [];
+  var tidal = payload.tidal || {};
+  var matches = Array.isArray(tidal.matches) ? tidal.matches : [];
+  var exactMatches = matches.filter(function(match) {
+    return match && match.id != null && /^\d+$/.test(String(match.id)) &&
+      (!match.isrc || String(match.isrc).trim().toUpperCase() === isrc);
+  });
 
-      const exact = matches.filter(function (match) {
-        return match && /^\d+$/.test(String(match.id || '')) && normalizeIsrc(match.isrc) === isrc;
-      });
-      exact.sort(function (a, b) {
-        return (Number(b.popularity) || 0) - (Number(a.popularity) || 0);
-      });
+  if (String(tidal.status || '').toLowerCase() !== 'found' || !exactMatches.length) {
+    throw new Error('No exact TIDAL match for ISRC ' + isrc);
+  }
 
-      const id = exact.length ? String(exact[0].id) : null;
-      return writeCache(key, id, id ? POSITIVE_TTL : NEGATIVE_TTL);
-    } catch (_) {
-      return writeCache(key, null, NEGATIVE_TTL);
-    } finally {
-      pending.delete(key);
-    }
-  })();
-
-  pending.set(key, task);
-  return task;
+  exactMatches.sort(function(a, b) {
+    return (Number(b.popularity) || 0) - (Number(a.popularity) || 0);
+  });
+  return String(exactMatches[0].id);
 }
 
-function extractTrack(payload) {
-  let node = payload;
-  for (let i = 0; i < 6 && node && typeof node === 'object'; i++) {
-    if (node.album || node.videoCover) return node;
-    if (!node.data || typeof node.data !== 'object') break;
-    node = node.data;
+function extractVideoCover(info) {
+  // The HiFi API response used by the supplied reference nests the track
+  // payload under data and the animated asset under data.album.videoCover.
+  var current = info;
+  for (var depth = 0; depth < 5 && isObject(current); depth++) {
+    if (isObject(current.album) && current.album.videoCover) {
+      return current.album.videoCover;
+    }
+    if (!isObject(current.data)) break;
+    current = current.data;
   }
   return null;
 }
 
-function makeVideoUrl(value) {
-  if (typeof value !== 'string' || !value.trim()) return null;
-  const raw = value.trim();
-  if (/^https:\/\//i.test(raw)) return raw;
+function buildProxyUrl(videoCover) {
+  if (typeof videoCover !== 'string' || !videoCover.trim()) return null;
+  var path = videoCover.trim();
 
-  // TIDAL videoCover may be supplied as a UUID-like identifier.
-  const path = raw.replace(/-/g, '/').replace(/^\/+|\/+$/g, '');
-  if (!/^[a-f0-9]{8}\/[a-f0-9]{4}\/[a-f0-9]{4}\/[a-f0-9]{4}\/[a-f0-9]{12}$/i.test(path)) {
-    return null;
-  }
-  return 'https://resources.tidal.com/images/' + path + '/1280x1280.mp4';
+  // videoCover is a TIDAL asset UUID/path. Preserve its slash-separated
+  // structure and normalize only the leading slash for URL concatenation.
+  path = path.replace(/^https?:\/\/(?:www\.)?tidal\.com/i, '');
+  path = path.replace(/^\/+/, '');
+  path = path.replace(/\/+$/, '');
+  if (!path || /[?#\\]/.test(path) || path.split('/').some(function(part) {
+    return !part || part === '.' || part === '..';
+  })) return null;
+
+  return TIDAL_VIDEO_BASE + '/' + path + '/1280x1280.mp4';
 }
 
-async function getAnimatedCover(trackId) {
-  const key = 'cover:' + trackId;
-  const cached = readCache(key);
-  if (cached !== undefined) return cached;
-  if (pending.has(key)) return pending.get(key);
-
-  const task = (async function () {
-    try {
-      const payload = await getJson(
-        TIDAL_API + '/info/?id=' + encodeURIComponent(trackId),
-        'TIDAL info lookup'
-      );
-      const track = extractTrack(payload);
-      const album = track && track.album ? track.album : null;
-      const cover = makeVideoUrl((album && album.videoCover) || (track && track.videoCover));
-      return writeCache(key, cover, cover ? POSITIVE_TTL : NEGATIVE_TTL);
-    } catch (_) {
-      return writeCache(key, null, NEGATIVE_TTL);
-    } finally {
-      pending.delete(key);
-    }
-  })();
-
-  pending.set(key, task);
-  return task;
+async function resolveArtwork(isrc) {
+  var trackId = await resolveTidalTrackId(isrc);
+  var info = await getJson(
+    TIDAL_API_BASE + '/info/?id=' + encodeURIComponent(trackId),
+    'TIDAL info lookup'
+  );
+  var videoCover = extractVideoCover(info);
+  var videoUrl = buildProxyUrl(videoCover);
+  if (!videoUrl) throw new Error('TIDAL info response did not contain a usable album.videoCover');
+  return videoUrl;
 }
 
-async function getAnimatedArtwork(albumId, country, shape, context) {
-  // Album identifiers are not assumed to be TIDAL IDs. Artwork is resolved
-  // from an ISRC supplied by the module playback context, when available.
-  const isrc = contextIsrc([context, shape, country, albumId]);
+async function getArtworkForIsrc(isrc) {
   if (!isrc) return null;
 
-  const tidalId = await resolveTidalId(isrc);
-  if (!tidalId) return null;
-  return getAnimatedCover(tidalId);
+  var cached = cacheGet(isrc);
+  if (cached !== undefined) return cached;
+
+  if (pendingRequests.has(isrc)) return pendingRequests.get(isrc);
+
+  var task = resolveArtwork(isrc).then(function(url) {
+    cacheSet(isrc, url, CACHE_TTL_MS);
+    return url;
+  }).catch(function() {
+    cacheSet(isrc, null, MISS_TTL_MS);
+    return null;
+  }).finally(function() {
+    pendingRequests.delete(isrc);
+  });
+
+  pendingRequests.set(isrc, task);
+  return task;
 }
 
-async function getAnimatedArtistArtwork() {
-  // Artist motion artwork is not part of the TIDAL-only v1 implementation.
-  return null;
+function getAnimatedArtwork(albumId, country, shape, context) {
+  var isrc = extractIsrc([albumId, country, shape, context]);
+  return getArtworkForIsrc(isrc);
+}
+
+function getAnimatedArtistArtwork(artistId, country, shape, context) {
+  // TIDAL artist motion artwork is not part of this TIDAL-track/ISRC v1.
+  return Promise.resolve(null);
 }
 
 return {
-  id: 'motion',
+  id: 'motion-animated-artwork',
   name: 'Motion',
   version: MODULE_VERSION,
-  description: 'TIDAL animated album artwork resolved through track ISRCs.',
+  description: 'TIDAL animated artwork resolved from the active track ISRC',
+  type: 'animated-artwork',
+  category: 'animated-artwork',
   getAnimatedArtwork: getAnimatedArtwork,
   getAnimatedArtistArtwork: getAnimatedArtistArtwork
 };
