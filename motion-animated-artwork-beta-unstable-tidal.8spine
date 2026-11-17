@@ -1,1006 +1,180 @@
-const API_DEFAULT = 'https://tidal.alx12.dpdns.org';
-const MODULE_VERSION = '1.0.1';
-const ISRC_RESOLVER_BASE = 'https://isrc.xander12.workers.dev';
+// MOTION — TIDAL Animated Artwork for 8SPINE
+// Standalone artwork module. Does not contain or modify Lumen source.
+// v1.0.0 — TIDAL only
 
-const QUALITY = Object.freeze({
-  LOW: 'LOW',
-  HIGH: 'HIGH',
-  LOSSLESS: 'LOSSLESS',
-  HI_RES_LOSSLESS: 'HI_RES_LOSSLESS',
-  DOLBY_ATMOS: 'DOLBY_ATMOS'
-});
+const MODULE_VERSION = '1.0.0';
+const TIDAL_API = 'https://tidal.alx12.dpdns.org';
+const ISRC_API = 'https://isrc.xander12.workers.dev';
 
-// Metadata caches only. Signed manifest URLs are deliberately never cached.
-const trackCache = new Map();
-const externalResolutionCache = new Map();
-const TRACK_CACHE_TTL = 30 * 60 * 1000;
-const RESOLUTION_CACHE_TTL = 10 * 60 * 1000;
-const CACHE_MAX_ENTRIES = 300;
+const POSITIVE_TTL = 6 * 60 * 60 * 1000;
+const NEGATIVE_TTL = 30 * 60 * 1000;
+const MAX_CACHE_SIZE = 250;
 
-function readSetting(context, name, fallback) {
-  const settings = context && context.settings;
-  if (!settings || settings[name] == null) return fallback;
-  const entry = settings[name];
-  const value = entry && typeof entry === 'object' &&
-    Object.prototype.hasOwnProperty.call(entry, 'value') ? entry.value : entry;
-  return value == null || value === '' ? fallback : value;
+const cache = new Map();
+const pending = new Map();
+
+function normalizeIsrc(value) {
+  const candidate = String(value || '').trim().toUpperCase();
+  return /^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(candidate) ? candidate : null;
 }
 
-function asBoolean(value, fallback) {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'number') return value !== 0;
-  if (value == null || value === '') return fallback;
-  const normalized = String(value).trim().toLowerCase();
-  if (['true', '1', 'yes', 'on', 'enabled'].includes(normalized)) return true;
-  if (['false', '0', 'no', 'off', 'disabled'].includes(normalized)) return false;
-  return fallback;
-}
+function findIsrc(value, depth) {
+  if (!value || typeof value !== 'object' || depth > 5) return null;
 
-function getApiBase(context) {
-  const configured = readSetting(context, 'apiInstance', API_DEFAULT);
-  const value = String(configured || API_DEFAULT).trim().replace(/\/+$/, '');
-  let parsed;
-  try {
-    parsed = new URL(value);
-  } catch (error) {
-    throw new Error('Invalid API instance URL: ' + error.message);
-  }
-  if (parsed.protocol !== 'https:' &&
-      !(parsed.protocol === 'http:' &&
-        (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'))) {
-    throw new Error('API instance must use HTTPS (HTTP is allowed only for localhost)');
-  }
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error('API instance must not contain credentials, a query string, or a fragment');
-  }
-  return parsed.origin + parsed.pathname.replace(/\/+$/, '');
-}
+  const direct = normalizeIsrc(
+    value.isrc || value.ISRC || value.isrcCode ||
+    (value.externalIds && value.externalIds.isrc)
+  );
+  if (direct) return direct;
 
-function apiUrl(endpoint, context) {
-  const path = String(endpoint || '').trim();
-  if (!path || /^https?:\/\//i.test(path) || path.startsWith('//')) {
-    throw new Error('API requests must use a relative endpoint path');
-  }
-  const base = getApiBase(context);
-  return base + '/' + path.replace(/^\/+/, '');
-}
-
-function queueUrl(endpoint, context) {
-  const raw = String(endpoint || '').trim();
-  if (!raw) throw new Error('Playback queue response did not include a status URL');
-  const base = new URL(getApiBase(context));
-  const resolved = new URL(raw, base.origin + '/');
-  if (resolved.origin !== base.origin || resolved.protocol !== 'https:' &&
-      !(resolved.protocol === 'http:' &&
-        (resolved.hostname === 'localhost' || resolved.hostname === '127.0.0.1'))) {
-    throw new Error('Playback queue URL does not belong to the configured API instance');
-  }
-  return resolved.href;
-}
-
-function getAdaptive(context) {
-  return asBoolean(readSetting(context, 'adaptive', true), true);
-}
-
-function isExplicitEnabled(context) {
-  return asBoolean(readSetting(context, 'explicitContent', true), true);
-}
-
-function getFallbackMode(context) {
-  return String(readSetting(context, 'fallback', 'Flexible')).trim().toLowerCase() === 'strict'
-    ? 'strict' : 'flexible';
-}
-
-function normalizeQuality(value) {
-  if (value && typeof value === 'object') {
-    value = value.value || value.quality || value.id || value.name || '';
-  }
-  const candidate = String(value == null ? '' : value).trim().toUpperCase()
-    .replace(/[\s-]+/g, '_');
-  const aliases = {
-    FLAC_HIRES: QUALITY.HI_RES_LOSSLESS,
-    HIRES: QUALITY.HI_RES_LOSSLESS,
-    HIRES_LOSSLESS: QUALITY.HI_RES_LOSSLESS,
-    HI_RES: QUALITY.HI_RES_LOSSLESS,
-    'FLAC_24_BIT': QUALITY.HI_RES_LOSSLESS,
-    FLAC: QUALITY.LOSSLESS,
-    FLAC_LOSSLESS: QUALITY.LOSSLESS,
-    LOSSLESS_FLAC: QUALITY.LOSSLESS,
-    EAC3_JOC: QUALITY.DOLBY_ATMOS,
-    ATMOS: QUALITY.DOLBY_ATMOS,
-    DOLBY_ATMOS: QUALITY.DOLBY_ATMOS,
-    AACLC: QUALITY.HIGH,
-    AAC_320KBPS: QUALITY.HIGH,
-    '320KBPS': QUALITY.HIGH,
-    HEAACV1: QUALITY.LOW,
-    AAC_96KBPS: QUALITY.LOW,
-    '96KBPS': QUALITY.LOW
-  };
-  if (aliases[candidate]) return aliases[candidate];
-  return Object.prototype.hasOwnProperty.call(QUALITY, candidate) ? QUALITY[candidate] : null;
-}
-
-function getSelectedQuality(context, preferredQuality) {
-  // The saved selector takes precedence; a runtime preference is the fallback.
-  const configured = normalizeQuality(readSetting(context, 'quality', null));
-  if (configured) return configured;
-  return normalizeQuality(preferredQuality) || QUALITY.HI_RES_LOSSLESS;
-}
-
-function getRequestHeaders() {
-  return {
-    Accept: 'application/json',
-    'User-Agent': 'lumen/' + MODULE_VERSION,
-    'X-Lumen-Client': 'lumen/' + MODULE_VERSION
-  };
-}
-
-function sleep(milliseconds) {
-  return new Promise(function(resolve) { setTimeout(resolve, milliseconds); });
-}
-
-function parseRetryAfter(value) {
-  if (value == null || value === '') return 1000;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds)) return Math.max(250, Math.min(30000, seconds * 1000));
-  const date = Date.parse(value);
-  if (Number.isFinite(date)) return Math.max(250, Math.min(30000, date - Date.now()));
-  return 1000;
-}
-
-async function responseJson(response, label) {
-  try {
-    return await response.json();
-  } catch (error) {
-    const detail = await response.text().catch(function() { return ''; });
-    throw new Error((label || 'API') + ' returned invalid JSON' +
-      (detail ? ': ' + detail.slice(0, 180) : ''));
-  }
-}
-
-async function makeHttpError(response, prefix) {
-  let detail = '';
-  try {
-    const body = await response.text();
-    if (body) {
-      try {
-        const parsed = JSON.parse(body);
-        detail = parsed.detail || parsed.message || parsed.error || body;
-      } catch (error) {
-        detail = body;
-      }
-    }
-  } catch (error) {}
-  const message = (prefix || 'API request failed') + ' (HTTP ' + response.status + ')' +
-    (detail ? ': ' + String(detail).slice(0, 220) : '');
-  const result = new Error(message);
-  result.status = response.status;
-  result.detail = detail;
-  return result;
-}
-
-async function pollPlaybackQueue(job, firstRetryAfter, context) {
-  const statusEndpoint = job && (job.statusUrl || job.location || job.pollUrl);
-  const cancelEndpoint = job && (job.cancelUrl || statusEndpoint);
-  const statusUrl = queueUrl(statusEndpoint, context);
-  const cancelUrl = cancelEndpoint ? queueUrl(cancelEndpoint, context) : null;
-  const startedAt = Date.now();
-  const timeoutMs = 4 * 60 * 1000;
-  let delay = parseRetryAfter(firstRetryAfter);
-  let networkFailures = 0;
-
-  while (Date.now() - startedAt < timeoutMs) {
-    await sleep(Math.min(delay, Math.max(250, timeoutMs - (Date.now() - startedAt))));
-    let response;
-    try {
-      response = await fetch(statusUrl, { method: 'GET', headers: getRequestHeaders() });
-      networkFailures = 0;
-    } catch (error) {
-      networkFailures += 1;
-      if (networkFailures >= 3) throw new Error('Playback queue polling failed: ' + error.message);
-      delay = 1000;
-      continue;
-    }
-
-    if (response.status === 202) {
-      const pending = await responseJson(response, 'Playback queue');
-      if (pending.status === 'failed') {
-        throw new Error(pending.detail || pending.error || 'Queued playback request failed');
-      }
-      if (pending.status === 'cancelled') {
-        throw new Error('Queued playback request was cancelled');
-      }
-      delay = parseRetryAfter(response.headers && response.headers.get('Retry-After'));
-      continue;
-    }
-
-    if (response.ok) return responseJson(response, 'Queued playback response');
-    throw await makeHttpError(response, 'Playback queue poll failed');
-  }
-
-  // The backend supports DELETE on the queue URL; release stale queued work
-  // instead of leaving the request running after the client has timed out.
-  if (cancelUrl) {
-    try {
-      await fetch(cancelUrl, { method: 'DELETE', headers: getRequestHeaders() });
-    } catch (error) {}
-  }
-  throw new Error('Playback request remained queued for four minutes and was cancelled');
-}
-
-async function requestApi(endpoint, context) {
-  const normalized = String(endpoint || '');
-  if (/\/track\/?(?:\?|$)/i.test(normalized)) {
-    throw new Error('Legacy /track/ endpoint is disabled; use /trackManifests/');
-  }
-  const response = await fetch(apiUrl(normalized, context), {
-    method: 'GET',
-    headers: getRequestHeaders()
-  });
-
-  if (response.status === 202) {
-    const queued = await responseJson(response, 'Playback queue response');
-    if (!queued.statusUrl) throw new Error('Received HTTP 202 without a statusUrl');
-    const retryAfter = response.headers && response.headers.get('Retry-After');
-    return pollPlaybackQueue(queued, retryAfter, context);
-  }
-  if (!response.ok) throw await makeHttpError(response, 'HiFi API request failed');
-  return responseJson(response, 'HiFi API response');
-}
-
-function isFormatUnavailable(error) {
-  if (!error) return false;
-  const status = Number(error.status);
-  const detail = String(error.detail || error.message || '').toLowerCase();
-  // Do not treat auth failures, permission failures, or generic 404s as a
-  // missing quality. Retry only errors that explicitly refer to format choice.
-  return [400, 404, 422].includes(status) &&
-    /(format|quality|manifest|unsupported|unavailable)/i.test(detail);
-}
-
-function getResponsePayload(response) {
-  const outer = response && response.data ? response.data : response;
-  return outer && outer.data ? outer.data : outer;
-}
-
-function getManifestAttributes(response) {
-  // main.py wraps upstream JSON as {version, data: upstreamResponse}; the
-  // v2 trackManifests response itself nests another `data` object before
-  // `attributes`. Search only the documented data chain so both wrapped and
-  // direct responses are handled without guessing at arbitrary object fields.
-  let current = response;
-  for (let depth = 0; depth < 6 && current && typeof current === 'object'; depth++) {
-    if (current.attributes && typeof current.attributes === 'object') {
-      return current.attributes;
-    }
-    if (!current.data || typeof current.data !== 'object') break;
-    current = current.data;
-  }
-  return {};
-}
-
-function getManifestFormats(response) {
-  const formats = getManifestAttributes(response).formats;
-  return Array.isArray(formats)
-    ? formats.map(function(value) { return String(value).trim().toUpperCase(); }).filter(Boolean)
-    : [];
-}
-
-function extractManifestUrl(response) {
-  const attributes = getManifestAttributes(response);
-  const candidate = attributes.uri;
-  if (typeof candidate !== 'string' || !candidate.trim()) return null;
-  try {
-    const url = new URL(candidate);
-    return url.protocol === 'https:' ? url.href : null;
-  } catch (error) {
-    return null;
-  }
-}
-
-function getFormatOrder(selectedQuality, fallbackMode) {
-  const quality = normalizeQuality(selectedQuality) || QUALITY.HI_RES_LOSSLESS;
-  const selectedFormat = {
-    DOLBY_ATMOS: 'EAC3_JOC',
-    HI_RES_LOSSLESS: 'FLAC_HIRES',
-    LOSSLESS: 'FLAC',
-    HIGH: 'AACLC',
-    LOW: 'HEAACV1'
-  }[quality];
-  if (fallbackMode === 'strict') return [selectedFormat];
-
-  // Atmos is included only when Atmos was explicitly selected. The remaining
-  // fallback steps move downward in quality and never silently upgrade AAC.
-  const tiers = {
-    DOLBY_ATMOS: ['EAC3_JOC', 'FLAC_HIRES', 'FLAC', 'AACLC', 'HEAACV1'],
-    HI_RES_LOSSLESS: ['FLAC_HIRES', 'FLAC', 'AACLC', 'HEAACV1'],
-    LOSSLESS: ['FLAC', 'AACLC', 'HEAACV1'],
-    HIGH: ['AACLC', 'HEAACV1'],
-    LOW: ['HEAACV1']
-  };
-  return tiers[quality].slice();
-}
-
-function buildManifestEndpoint(trackId, formats, adaptive) {
-  const params = [
-    ['id', String(trackId)],
-    ['uriScheme', 'HTTPS'],
-    ['adaptive', adaptive ? 'true' : 'false'],
-    ['usage', 'PLAYBACK'],
-    ['manifestType', 'HLS']
-  ];
-  formats.forEach(function(format) { params.push(['formats', format]); });
-  return '/trackManifests/?' + params.map(function(pair) {
-    return encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1]);
-  }).join('&');
-}
-
-function getTags(track) {
-  if (!track) return [];
-  if (track.mediaMetadata && Array.isArray(track.mediaMetadata.tags)) return track.mediaMetadata.tags;
-  return Array.isArray(track.tags) ? track.tags : [];
-}
-
-function isExplicitTrack(track) {
-  return !!track && (track.explicit === true || String(track.explicit).toLowerCase() === 'true');
-}
-
-function hasExplicitMetadata(track) {
-  if (!track || !Object.prototype.hasOwnProperty.call(track, 'explicit')) return false;
-  return typeof track.explicit === 'boolean' ||
-    ['true', 'false'].includes(String(track.explicit).toLowerCase());
-}
-
-function isHiResTrack(track) {
-  if (!track) return false;
-  if (/HI.?RES/i.test(String(track.audioQuality || ''))) return true;
-  if (getTags(track).some(function(tag) { return /HI.?RES/i.test(String(tag)); })) return true;
-  return Array.isArray(track.audioModes) &&
-    track.audioModes.some(function(mode) { return /HI.?RES/i.test(String(mode)); });
-}
-
-function isDolbyAtmos(track) {
-  if (!track) return false;
-  const modes = [];
-  if (Array.isArray(track.audioModes)) modes.push.apply(modes, track.audioModes);
-  if (Array.isArray(track.audio_modes)) modes.push.apply(modes, track.audio_modes);
-  if (track.album && Array.isArray(track.album.audioModes)) modes.push.apply(modes, track.album.audioModes);
-  if (typeof track.audioMode === 'string') modes.push(track.audioMode);
-  if (track.album && typeof track.album.audioMode === 'string') modes.push(track.album.audioMode);
-  if (modes.some(function(mode) { return /DOLBY_ATMOS|ATMOS/i.test(String(mode)); })) return true;
-  return getTags(track).some(function(tag) { return /DOLBY.?ATMOS/i.test(String(tag)); });
-}
-
-function cleanTitle(value) {
-  return String(value || '').toLowerCase()
-    .replace(/\s*[\[(](?:feat(?:uring)?|ft|with)\.?\s+.*?[\])]/gi, '')
-    .replace(/\s+(?:feat(?:uring)?|ft)\.?\s+.*$/gi, '')
-    .replace(/\s*[\[(](?:dolby\s*atmos|atmos|spatial\s*audio|spatial)[\])]/gi, '')
-    .replace(/[^a-z0-9]/g, '')
-    .trim();
-}
-
-function cleanPrimaryArtist(value) {
-  return String(value || '').toLowerCase().split(/[,&;/]/)[0]
-    .replace(/[^a-z0-9]/g, '').trim();
-}
-
-function getArtistName(track) {
-  if (!track) return '';
-  if (track.artist && typeof track.artist === 'object' && track.artist.name) return track.artist.name;
-  if (Array.isArray(track.artists) && track.artists[0] && track.artists[0].name) {
-    return track.artists[0].name;
-  }
-  if (typeof track.artist === 'string') return track.artist;
-  if (typeof track.artistName === 'string') return track.artistName;
-  return '';
-}
-
-function getArtistId(track) {
-  if (!track) return null;
-  if (track.artist && typeof track.artist === 'object' && track.artist.id != null) {
-    return String(track.artist.id);
-  }
-  if (Array.isArray(track.artists) && track.artists[0] && track.artists[0].id != null) {
-    return String(track.artists[0].id);
+  const keys = ['track', 'metadata', 'item', 'context', 'currentTrack', 'nowPlaying', 'mediaItem'];
+  for (const key of keys) {
+    const found = findIsrc(value[key], depth + 1);
+    if (found) return found;
   }
   return null;
 }
 
-function getSearchQualityBadge(track) {
-  if (isDolbyAtmos(track)) return 'Dolby Atmos';
-  if (isHiResTrack(track)) return 'Hi-Res Lossless';
-  const quality = String(track && track.audioQuality || '').toUpperCase();
-  if (quality === 'LOSSLESS') return 'Lossless';
-  if (quality === 'HIGH') return 'AAC 320kbps';
-  if (quality === 'LOW') return 'AAC 96kbps';
-  return 'Unknown';
-}
-
-function getCatalogQualities(track) {
-  const values = [];
-  const add = function(value) {
-    const normalized = normalizeQuality(value);
-    if (normalized && !values.includes(normalized)) values.push(normalized);
-  };
-  getTags(track).forEach(add);
-  add(track && track.audioQuality);
-  if (isDolbyAtmos(track)) add(QUALITY.DOLBY_ATMOS);
-  if (isHiResTrack(track)) add(QUALITY.HI_RES_LOSSLESS);
-  return values;
-}
-
-function prioritizeAtmosTracks(tracks) {
-  return tracks.map(function(track, index) {
-    return { track: track, index: index };
-  }).sort(function(a, b) {
-    const aAtmos = a.track.catalogIsAtmos === true;
-    const bAtmos = b.track.catalogIsAtmos === true;
-    return Number(bAtmos) - Number(aAtmos) || a.index - b.index;
-  }).map(function(entry) { return entry.track; });
-}
-
-function prioritizeExplicitDuplicates(tracks) {
-  const output = tracks.slice();
-  for (let i = 0; i < output.length; i++) {
-    const a = output[i];
-    const titleKey = cleanTitle(a.title);
-    const artistKey = cleanPrimaryArtist(a.artist);
-    if (!titleKey || !artistKey || isExplicitTrack(a)) continue;
-    for (let j = i + 1; j < output.length; j++) {
-      const b = output[j];
-      if (isExplicitTrack(b) && cleanTitle(b.title) === titleKey &&
-          cleanPrimaryArtist(b.artist) === artistKey) {
-        output.splice(i, 0, output.splice(j, 1)[0]);
-        break;
-      }
-    }
+function contextIsrc(args) {
+  for (const arg of args) {
+    const found = findIsrc(arg, 0);
+    if (found) return found;
   }
-  return output;
+  return null;
 }
 
-function getTidalCover(cover, size) {
-  if (!cover) return null;
-  const value = String(cover).trim();
-  if (/^https:\/\//i.test(value)) return value;
-  if (/^http:\/\//i.test(value)) return value.replace(/^http:/i, 'https:');
-  return 'https://resources.tidal.com/images/' + value.replace(/-/g, '/') + '/' +
-    (size || '640x640') + '.jpg';
-}
-
-function getTrackInput(trackId, context) {
-  const objectInput = trackId && typeof trackId === 'object' ? trackId : null;
-  const contextTrack = context && [context.track, context.metadata, context.item]
-    .find(function(candidate) { return candidate && typeof candidate === 'object'; }) || null;
-  const track = objectInput || contextTrack || {};
-  let rawId = trackId;
-  if (objectInput) {
-    rawId = objectInput.id != null ? objectInput.id :
-      objectInput.sourceId != null ? objectInput.sourceId :
-      objectInput.trackId != null ? objectInput.trackId :
-      objectInput.tidalId != null ? objectInput.tidalId : '';
-  }
-  if ((rawId == null || rawId === '') && contextTrack) {
-    rawId = contextTrack.id != null ? contextTrack.id :
-      contextTrack.sourceId != null ? contextTrack.sourceId :
-      contextTrack.trackId != null ? contextTrack.trackId : '';
-  }
-  const provider = String(track.provider || track.source || track.platform || '').toLowerCase();
-  const rawIdText = String(rawId == null ? '' : rawId).trim();
-  const isIsrcInput = /^isrc:/i.test(rawIdText) || /^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/i.test(rawIdText);
-  if (!isIsrcInput && provider.indexOf('apple') !== -1 && rawId != null && !/^apple:/i.test(rawIdText)) {
-    rawId = 'apple:' + rawIdText;
-  } else if (!isIsrcInput && (track.isTidal === true || provider.indexOf('tidal') !== -1) &&
-      rawId != null && !/^tidal:/i.test(rawIdText)) {
-    rawId = 'tidal:' + rawIdText;
-  }
-  let playbackContext = context || {};
-  if (objectInput && objectInput !== contextTrack) {
-    playbackContext = Object.assign({}, playbackContext, { track: objectInput });
-  } else if (!playbackContext.track && contextTrack) {
-    playbackContext = Object.assign({}, playbackContext, { track: contextTrack });
-  }
-  return {
-    rawId: String(rawId == null ? '' : rawId).trim(),
-    track: track,
-    context: playbackContext
-  };
-}
-
-function parsePlayableId(trackId) {
-  const id = String(trackId || '').trim();
-  if (/^tidal:/i.test(id)) return { type: 'tidal', value: id.slice(6) };
-  if (/^apple:/i.test(id)) return { type: 'apple', value: id.slice(6) };
-  if (/^isrc:/i.test(id)) return { type: 'isrc', value: id.slice(5).trim().toUpperCase() };
-  if (/^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/i.test(id)) return { type: 'isrc', value: id.toUpperCase() };
-  const urlMatch = id.match(/^https?:\/\/(?:www\.)?tidal\.com\/(?:browse\/)?track\/(\d+)/i);
-  if (urlMatch) return { type: 'tidal', value: urlMatch[1] };
-  if (/^\d+$/.test(id)) return { type: 'tidal', value: id };
-  return { type: 'unknown', value: id };
-}
-
-function cacheGet(cache, key) {
+function readCache(key) {
   const entry = cache.get(key);
-  if (!entry) return null;
+  if (!entry) return undefined;
   if (entry.expiresAt <= Date.now()) {
     cache.delete(key);
-    return null;
+    return undefined;
   }
-  // Refresh insertion order for a small LRU-style cache.
   cache.delete(key);
   cache.set(key, entry);
   return entry.value;
 }
 
-function cacheSet(cache, key, value, ttl) {
+function writeCache(key, value, ttl) {
   cache.delete(key);
   cache.set(key, { value: value, expiresAt: Date.now() + ttl });
-  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
+  while (cache.size > MAX_CACHE_SIZE) cache.delete(cache.keys().next().value);
   return value;
 }
 
-function mapTrack(item, albumFallback) {
-  const album = item.album || albumFallback || {};
-  const title = item.title || 'Unknown Title';
-  const artist = getArtistName(item) || getArtistName(album) || 'Unknown Artist';
-  const id = item.id == null ? '' : String(item.id);
-  const atmos = isDolbyAtmos(item);
-  const hiRes = isHiResTrack(item);
-  const badge = getSearchQualityBadge(item);
-  const mapped = {
-    id: id,
-    sourceId: id,
-    provider: 'Tidal',
-    title: title,
-    artist: artist,
-    artistId: getArtistId(item) || getArtistId(album),
-    album: album.title || 'Unknown Album',
-    albumId: album.id == null ? null : String(album.id),
-    albumCover: getTidalCover(album.cover),
-    duration: Number(item.duration) || 0,
-    trackNumber: item.trackNumber == null ? null : item.trackNumber,
-    discNumber: item.volumeNumber || 1,
-    isrc: item.isrc || null,
-    explicit: isExplicitTrack(item),
-    url: item.url || null,
-    audioQuality: badge,
-    catalogAudioQuality: badge,
-    catalogQualityHint: badge,
-    availableQualities: getCatalogQualities(item),
-    qualityVerified: false,
-    isHiRes: false,
-    isAtmos: false,
-    catalogIsHiRes: hiRes,
-    catalogIsAtmos: atmos,
-    isTidal: true
-  };
-  if (id) cacheSet(trackCache, id, mapped, TRACK_CACHE_TTL);
-  return mapped;
+async function getJson(url, label) {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { Accept: 'application/json', 'User-Agent': 'motion/' + MODULE_VERSION }
+  });
+  if (!response.ok) throw new Error(label + ' failed: HTTP ' + response.status);
+  return response.json();
 }
 
-function getSearchItems(result) {
-  const container = getResponsePayload(result);
-  if (Array.isArray(container)) return container;
-  if (!container || typeof container !== 'object') return [];
-  if (Array.isArray(container.items)) return container.items;
-  if (container.tracks && Array.isArray(container.tracks.items)) return container.tracks.items;
-  if (container.data && Array.isArray(container.data.items)) return container.data.items;
-  if (Array.isArray(container.tracks)) return container.tracks;
-  return [];
+async function resolveTidalId(isrc) {
+  const key = 'isrc:' + isrc;
+  const cached = readCache(key);
+  if (cached !== undefined) return cached;
+  if (pending.has(key)) return pending.get(key);
+
+  const task = (async function () {
+    try {
+      const payload = await getJson(ISRC_API + '/resolve/' + encodeURIComponent(isrc), 'ISRC resolver');
+      const matches = payload && payload.success === true && payload.tidal &&
+        payload.tidal.status === 'found' && Array.isArray(payload.tidal.matches)
+        ? payload.tidal.matches : [];
+
+      const exact = matches.filter(function (match) {
+        return match && /^\d+$/.test(String(match.id || '')) && normalizeIsrc(match.isrc) === isrc;
+      });
+      exact.sort(function (a, b) {
+        return (Number(b.popularity) || 0) - (Number(a.popularity) || 0);
+      });
+
+      const id = exact.length ? String(exact[0].id) : null;
+      return writeCache(key, id, id ? POSITIVE_TTL : NEGATIVE_TTL);
+    } catch (_) {
+      return writeCache(key, null, NEGATIVE_TTL);
+    } finally {
+      pending.delete(key);
+    }
+  })();
+
+  pending.set(key, task);
+  return task;
 }
 
-function getManifestFormatLabel(format) {
-  switch (String(format).toUpperCase()) {
-    case 'EAC3_JOC': return { label: 'Dolby Atmos', quality: QUALITY.DOLBY_ATMOS };
-    case 'FLAC_HIRES': return { label: 'Hi-Res Lossless', quality: QUALITY.HI_RES_LOSSLESS };
-    case 'FLAC': return { label: 'Lossless', quality: QUALITY.LOSSLESS };
-    case 'AACLC': return { label: 'AAC-LC', quality: QUALITY.HIGH };
-    case 'HEAACV1': return { label: 'HE-AAC v1', quality: QUALITY.LOW };
-    default: return { label: String(format), quality: String(format) };
-  }
-}
-
-function chooseAvailableFormat(preferenceOrder, returnedFormats) {
-  for (let i = 0; i < preferenceOrder.length; i++) {
-    if (returnedFormats.includes(preferenceOrder[i])) return preferenceOrder[i];
+function extractTrack(payload) {
+  let node = payload;
+  for (let i = 0; i < 6 && node && typeof node === 'object'; i++) {
+    if (node.album || node.videoCover) return node;
+    if (!node.data || typeof node.data !== 'object') break;
+    node = node.data;
   }
   return null;
 }
 
-function getResolvedTechnicalMetadata(format, attributes) {
-  const bitDepth = Number(attributes && attributes.bitDepth);
-  let sampleRate = Number(attributes && attributes.sampleRate);
-  if (Number.isFinite(sampleRate) && sampleRate > 1000) sampleRate = sampleRate / 1000;
-  return {
-    bitDepth: Number.isFinite(bitDepth) && bitDepth > 0 ? bitDepth : null,
-    sampleRate: Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : null,
-    bitrate: Number.isFinite(Number(attributes && attributes.bitrate))
-      ? Number(attributes.bitrate) : null
-  };
+function makeVideoUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const raw = value.trim();
+  if (/^https:\/\//i.test(raw)) return raw;
+
+  // TIDAL videoCover may be supplied as a UUID-like identifier.
+  const path = raw.replace(/-/g, '/').replace(/^\/+|\/+$/g, '');
+  if (!/^[a-f0-9]{8}\/[a-f0-9]{4}\/[a-f0-9]{4}\/[a-f0-9]{4}\/[a-f0-9]{12}$/i.test(path)) {
+    return null;
+  }
+  return 'https://resources.tidal.com/images/' + path + '/1280x1280.mp4';
 }
 
-async function resolveIsrcEndpoint(isrc, context) {
-  const normalized = String(isrc || '').trim().toUpperCase();
-  if (!/^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(normalized)) {
-    throw new Error('Invalid ISRC: ' + normalized);
-  }
+async function getAnimatedCover(trackId) {
+  const key = 'cover:' + trackId;
+  const cached = readCache(key);
+  if (cached !== undefined) return cached;
+  if (pending.has(key)) return pending.get(key);
 
-  const response = await fetch(ISRC_RESOLVER_BASE + '/resolve/' + encodeURIComponent(normalized), {
-    method: 'GET',
-    headers: { Accept: 'application/json', 'User-Agent': 'lumen/' + MODULE_VERSION }
-  });
-  if (!response.ok) {
-    throw await makeHttpError(response, 'ISRC resolver request failed');
-  }
-
-  const payload = await responseJson(response, 'ISRC resolver');
-  if (!payload || payload.success !== true) {
-    throw new Error(payload && (payload.error || payload.message)
-      ? String(payload.error || payload.message)
-      : 'ISRC resolver did not confirm a match');
-  }
-
-  const tidal = payload.tidal || {};
-  const matches = Array.isArray(tidal.matches) ? tidal.matches : [];
-  const validMatches = matches.filter(function(match) {
-    return match && match.id != null && /^\d+$/.test(String(match.id)) &&
-      (!match.isrc || String(match.isrc).trim().toUpperCase() === normalized) &&
-      (isExplicitEnabled(context) || !isExplicitTrack(match));
-  });
-  if (String(tidal.status || '').toLowerCase() !== 'found' || !validMatches.length) {
-    throw new Error('No Tidal track was found for ISRC ' + normalized);
-  }
-
-  // Prefer the most popular exact-ISRC match if the resolver returns duplicates.
-  validMatches.sort(function(a, b) {
-    return (Number(b.popularity) || 0) - (Number(a.popularity) || 0);
-  });
-  return String(validMatches[0].id);
-}
-
-async function resolveExternalTrack(rawId, context) {
-  const track = context && (context.track || context.metadata || context.item) || {};
-  const title = track.title || track.name || track.trackName;
-  const artist = getArtistName(track) || track.artistName || track.artist_name || '';
-  const parsedId = parsePlayableId(rawId);
-  const targetIsrc = String(track.isrc || track.ISRC ||
-    (parsedId.type === 'isrc' ? parsedId.value : '')).trim().toUpperCase();
-
-  if (targetIsrc) {
-    return resolveIsrcEndpoint(targetIsrc, context);
-  }
-
-  if (!title || !artist) {
-    throw new Error('Cannot resolve this source to Tidal: an ISRC or both title and artist are required');
-  }
-
-  const query = encodeURIComponent(String(title) + ' ' + String(artist));
-  const result = await requestApi('/search/?s=' + query + '&limit=50', context);
-  let items = getSearchItems(result);
-  if (!isExplicitEnabled(context)) items = items.filter(function(item) { return !isExplicitTrack(item); });
-
-  const titleKey = cleanTitle(title);
-  const artistKey = cleanPrimaryArtist(artist);
-  const exact = items.filter(function(item) {
-    return item.id != null && cleanTitle(item.title) === titleKey &&
-      cleanPrimaryArtist(getArtistName(item)) === artistKey;
-  });
-  if (!exact.length) {
-    throw new Error('No exact Tidal title + artist match found for "' + title + '" by "' + artist + '"');
-  }
-
-  // Preserve explicit/non-explicit parity when there is more than one exact match.
-  const sourceExplicit = isExplicitTrack(track);
-  exact.sort(function(a, b) {
-    return Number(isExplicitTrack(b) === sourceExplicit) - Number(isExplicitTrack(a) === sourceExplicit);
-  });
-  mapTrack(exact[0]);
-  return String(exact[0].id);
-}
-
-async function resolveExternalTrackCached(rawId, context) {
-  const track = context && (context.track || context.metadata || context.item) || {};
-  const key = [
-    String(rawId || ''),
-    String(track.isrc || track.ISRC || ''),
-    String(track.title || track.name || ''),
-    getArtistName(track)
-  ].join('|').toLowerCase();
-  const cached = cacheGet(externalResolutionCache, key);
-  if (cached) return cached;
-
-  const pending = resolveExternalTrack(rawId, context);
-  cacheSet(externalResolutionCache, key, pending, RESOLUTION_CACHE_TTL);
-  try {
-    const resolvedId = await pending;
-    cacheSet(externalResolutionCache, key, Promise.resolve(resolvedId), RESOLUTION_CACHE_TTL);
-    return resolvedId;
-  } catch (error) {
-    externalResolutionCache.delete(key);
-    throw error;
-  }
-}
-
-async function searchTracks(query, limit, context, offset) {
-  const searchQuery = String(query == null ? '' : query).trim();
-  if (!searchQuery) return { tracks: [], total: 0, offset: 0, limit: 0, hasMore: false };
-
-  const requestedLimit = Number(limit);
-  const count = Number.isFinite(requestedLimit) && requestedLimit > 0
-    ? Math.min(500, Math.floor(requestedLimit)) : 25;
-  const requestedOffset = Number(offset);
-  const start = Number.isFinite(requestedOffset) && requestedOffset >= 0
-    ? Math.floor(requestedOffset) : 0;
-  const result = await requestApi('/search/?s=' + encodeURIComponent(searchQuery) +
-    '&limit=' + count + '&offset=' + start, context);
-  const container = getResponsePayload(result) || {};
-  let items = getSearchItems(result);
-  if (!isExplicitEnabled(context)) items = items.filter(function(item) { return !isExplicitTrack(item); });
-
-  let tracks = items.filter(function(item) { return item && item.id != null; })
-    .map(function(item) { return mapTrack(item); });
-  if (isExplicitEnabled(context)) tracks = prioritizeExplicitDuplicates(tracks);
-  tracks = prioritizeAtmosTracks(tracks);
-
-  const rawTotal = Number(container.totalNumberOfItems != null
-    ? container.totalNumberOfItems
-    : container.total != null ? container.total : tracks.length);
-  const total = Number.isFinite(rawTotal) && rawTotal >= 0 ? rawTotal : tracks.length;
-  return {
-    tracks: tracks,
-    total: total,
-    offset: start,
-    limit: count,
-    hasMore: start + items.length < total,
-    nextOffset: start + items.length < total ? start + items.length : null
-  };
-}
-
-async function getTrackStreamUrl(trackId, preferredQuality, context) {
-  const input = getTrackInput(trackId, context);
-  const playbackContext = input.context;
-  const parsed = parsePlayableId(input.rawId);
-  const cachedTrack = cacheGet(trackCache, parsed.value) || input.track || {};
-
-  if (!isExplicitEnabled(playbackContext) &&
-      (isExplicitTrack(cachedTrack) || isExplicitTrack(playbackContext.track))) {
-    throw new Error('Explicit tracks are disabled in module settings');
-  }
-
-  const selectedQuality = getSelectedQuality(playbackContext, preferredQuality);
-  const fallbackMode = getFallbackMode(playbackContext);
-  const adaptive = getAdaptive(playbackContext);
-  let tidalId;
-
-  if (parsed.type === 'tidal') {
-    tidalId = parsed.value;
-  } else if (parsed.type === 'unknown' && cachedTrack.isTidal === true && /^\d+$/.test(parsed.value)) {
-    tidalId = parsed.value;
-  } else {
-    tidalId = await resolveExternalTrackCached(input.rawId, playbackContext);
-  }
-
-  if (!/^\d+$/.test(String(tidalId))) throw new Error('Resolved Tidal track ID is invalid');
-
-  // When explicit content is disabled, verify the flag even for a directly
-  // supplied Tidal ID whose search metadata is not in this module's cache.
-  if (!isExplicitEnabled(playbackContext)) {
-    const knownTrack = cacheGet(trackCache, String(tidalId)) || input.track;
-    if (isExplicitTrack(knownTrack)) {
-      throw new Error('Explicit tracks are disabled in module settings');
+  const task = (async function () {
+    try {
+      const payload = await getJson(
+        TIDAL_API + '/info/?id=' + encodeURIComponent(trackId),
+        'TIDAL info lookup'
+      );
+      const track = extractTrack(payload);
+      const album = track && track.album ? track.album : null;
+      const cover = makeVideoUrl((album && album.videoCover) || (track && track.videoCover));
+      return writeCache(key, cover, cover ? POSITIVE_TTL : NEGATIVE_TTL);
+    } catch (_) {
+      return writeCache(key, null, NEGATIVE_TTL);
+    } finally {
+      pending.delete(key);
     }
-    if (!hasExplicitMetadata(knownTrack)) {
-      const infoResponse = await requestApi('/info/?id=' + encodeURIComponent(tidalId), playbackContext);
-      const infoTrack = getResponsePayload(infoResponse) || {};
-      if (isExplicitTrack(infoTrack)) {
-        throw new Error('Explicit tracks are disabled in module settings');
-      }
-      if (!Object.prototype.hasOwnProperty.call(infoTrack, 'explicit')) {
-        throw new Error('HiFi API did not provide explicit-content metadata; playback was blocked');
-      }
-      mapTrack(infoTrack);
-    }
-  }
+  })();
 
-  const formatOrder = getFormatOrder(selectedQuality, fallbackMode);
-  let resolved = null;
-  let returnedFormats = [];
-  let lastUnavailable = null;
-  let response = null;
-
-  if (adaptive) {
-    // hifi-api accepts repeated `formats` parameters. With adaptive=true it
-    // negotiates all requested formats in one playback request and returns
-    // one adaptive manifest URI plus the formats actually available.
-    response = await requestApi(buildManifestEndpoint(tidalId, formatOrder, true), playbackContext);
-    returnedFormats = getManifestFormats(response);
-    const manifestUrl = extractManifestUrl(response);
-    const actualFormat = chooseAvailableFormat(formatOrder, returnedFormats);
-    if (!manifestUrl) throw new Error('HiFi API response is missing data.data.attributes.uri');
-    if (!returnedFormats.length) throw new Error('HiFi API response is missing data.data.attributes.formats');
-    if (!actualFormat) {
-      throw new Error('None of the requested formats are available. API returned: ' + returnedFormats.join(', '));
-    }
-    resolved = { streamUrl: manifestUrl, format: actualFormat };
-  } else {
-    // Non-adaptive mode requests one format per call; only quality-related
-    // failures advance to the next lower tier.
-    for (let i = 0; i < formatOrder.length; i++) {
-      const format = formatOrder[i];
-      try {
-        response = await requestApi(buildManifestEndpoint(tidalId, [format], false), playbackContext);
-      } catch (error) {
-        if (isFormatUnavailable(error)) {
-          lastUnavailable = error;
-          continue;
-        }
-        throw error;
-      }
-
-      returnedFormats = getManifestFormats(response);
-      const manifestUrl = extractManifestUrl(response);
-      if (!returnedFormats.length) {
-        throw new Error('HiFi API response is missing data.data.attributes.formats');
-      }
-      if (!returnedFormats.includes(format)) {
-        lastUnavailable = new Error('Requested ' + format + ' but API returned ' + returnedFormats.join(', '));
-        continue;
-      }
-      if (!manifestUrl) throw new Error('HiFi API response is missing data.data.attributes.uri');
-      resolved = { streamUrl: manifestUrl, format: format };
-      break;
-    }
-  }
-
-  if (!resolved) {
-    throw new Error(lastUnavailable
-      ? 'Requested Tidal formats are unavailable: ' + lastUnavailable.message
-      : 'No playable Tidal manifest was returned for track ' + tidalId);
-  }
-
-  const attributes = getManifestAttributes(response);
-  const formatInfo = getManifestFormatLabel(resolved.format);
-  const technical = getResolvedTechnicalMetadata(resolved.format, attributes);
-  const metadataTrack = cacheGet(trackCache, tidalId) || input.track || {};
-  const audioQuality = formatInfo.label;
-  const sourceId = String(tidalId);
-  const originalId = input.rawId || sourceId;
-
-  return {
-    streamUrl: resolved.streamUrl,
-    streamType: 'hls',
-    mimeType: attributes.mimeType || 'application/x-mpegURL',
-    audioQuality: audioQuality,
-    qualityVerified: true,
-    provider: 'Tidal',
-    adaptive: adaptive,
-    requestedFormats: formatOrder.slice(),
-    availableFormats: returnedFormats.slice(),
-    track: {
-      id: String(originalId),
-      sourceId: sourceId,
-      provider: 'Tidal',
-      title: metadataTrack.title || input.track.title || null,
-      artist: getArtistName(metadataTrack) || getArtistName(input.track) || null,
-      album: metadataTrack.album || input.track.album || null,
-      albumCover: metadataTrack.albumCover || input.track.albumCover || null,
-      duration: Number(metadataTrack.duration || input.track.duration) || 0,
-      audioQuality: audioQuality,
-      quality: formatInfo.quality,
-      bitDepth: technical.bitDepth,
-      sampleRate: technical.sampleRate,
-      bitrate: technical.bitrate,
-      mimeType: attributes.mimeType || 'application/x-mpegURL',
-      isAtmos: resolved.format === 'EAC3_JOC',
-      isHiRes: resolved.format === 'FLAC_HIRES',
-      qualityVerified: true,
-      resolvedFormat: resolved.format,
-      availableFormats: returnedFormats.slice(),
-      adaptive: adaptive
-    }
-  };
+  pending.set(key, task);
+  return task;
 }
 
-async function getAlbum(albumId, context, offset) {
-  const rawId = albumId && typeof albumId === 'object'
-    ? (albumId.id != null ? albumId.id : albumId.albumId) : albumId;
-  const cleanId = String(rawId == null ? '' : rawId).replace(/^tidal:/i, '').trim();
-  if (!/^\d+$/.test(cleanId)) throw new Error('A valid Tidal album ID is required');
+async function getAnimatedArtwork(albumId, country, shape, context) {
+  // Album identifiers are not assumed to be TIDAL IDs. Artwork is resolved
+  // from an ISRC supplied by the module playback context, when available.
+  const isrc = contextIsrc([context, shape, country, albumId]);
+  if (!isrc) return null;
 
-  const requestedOffset = Number(offset);
-  const start = Number.isFinite(requestedOffset) && requestedOffset >= 0
-    ? Math.floor(requestedOffset) : 0;
-  const result = await requestApi('/album/?id=' + encodeURIComponent(cleanId) +
-    '&limit=500&offset=' + start, context);
-  const album = getResponsePayload(result) || {};
-  const rawItems = Array.isArray(album.items) ? album.items : [];
-  const tracks = rawItems.map(function(wrapper) {
-    if (!wrapper) return null;
-    if (wrapper.type && String(wrapper.type).toLowerCase() !== 'track') return null;
-    const item = wrapper.item || wrapper;
-    return item && item.id != null ? mapTrack(item, album) : null;
-  }).filter(function(item) {
-    return item && (isExplicitEnabled(context) || !item.explicit);
-  });
+  const tidalId = await resolveTidalId(isrc);
+  if (!tidalId) return null;
+  return getAnimatedCover(tidalId);
+}
 
-  const totalTracks = Number(album.numberOfTracks);
-  const total = Number.isFinite(totalTracks) && totalTracks >= 0 ? totalTracks : rawItems.length;
-  const hasMore = start + rawItems.length < total;
-  return {
-    id: String(album.id == null ? cleanId : album.id),
-    title: album.title || 'Unknown Album',
-    artist: getArtistName(album) || 'Unknown Artist',
-    cover: getTidalCover(album.cover),
-    releaseDate: album.releaseDate || null,
-    totalTracks: total,
-    offset: start,
-    limit: 500,
-    hasMore: hasMore,
-    nextOffset: hasMore ? start + rawItems.length : null,
-    tracks: tracks
-  };
+async function getAnimatedArtistArtwork() {
+  // Artist motion artwork is not part of the TIDAL-only v1 implementation.
+  return null;
 }
 
 return {
-  id: 'lumen',
-  name: 'lumen',
-  author: 'alx12',
+  id: 'motion',
+  name: 'Motion',
   version: MODULE_VERSION,
-  description: 'Tidal module w/ Dolby Support',
-  logo: 'https://images.unsplash.com/photo-1707380657461-eec3675cedb2?q=100&w=2048&h=2048&dpr=2&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=NHwxMjA3fDA%3D',
-  labels: ['HI-RES', 'DOLBY ATMOS', 'TIDAL', 'ISRC-RESOLUTION'],
-  settings: {
-    quality: {
-      type: 'selector',
-      label: 'Audio Quality',
-      description: 'Preferred format. Flexible fallback moves down the supported quality tiers.',
-      options: [
-        { label: 'Hi-Res Lossless', value: QUALITY.HI_RES_LOSSLESS },
-        { label: 'Lossless', value: QUALITY.LOSSLESS },
-        { label: 'Dolby Atmos', value: QUALITY.DOLBY_ATMOS },
-        { label: 'High (AAC 320kbps)', value: QUALITY.HIGH },
-        { label: 'Low (AAC 96kbps)', value: QUALITY.LOW }
-      ],
-      defaultValue: QUALITY.HI_RES_LOSSLESS
-    },
-    adaptive: {
-      type: 'selector',
-      label: 'Adaptive Streaming',
-      description: 'When enabled, request all allowed fallback formats together in one manifest request.',
-      options: [
-        { label: 'On', value: 'true' },
-        { label: 'Off', value: 'false' }
-      ],
-      defaultValue: 'true'
-    },
-    fallback: {
-      type: 'selector',
-      label: 'Fallback Mode',
-      description: 'Flexible permits lower-quality fallback. Strict requests only the selected format.',
-      options: [
-        { label: 'Flexible', value: 'Flexible' },
-        { label: 'Strict', value: 'Strict' }
-      ],
-      defaultValue: 'Flexible'
-    },
-    apiInstance: {
-      type: 'text',
-      label: 'HiFi API Instance',
-      description: 'HTTPS base URL for your temporary/private hifi-api instance. Leave empty to use the default.',
-      defaultValue: ''
-    },
-    explicitContent: {
-      type: 'selector',
-      label: 'Explicit Content',
-      description: 'When disabled, explicit tracks are excluded from search, album results, and source resolution.',
-      options: [
-        { label: 'Enabled', value: 'Enabled' },
-        { label: 'Disabled', value: 'Disabled' }
-      ],
-      defaultValue: 'Enabled'
-    }
-  },
-  searchTracks: searchTracks,
-  getTrackStreamUrl: getTrackStreamUrl,
-  getAlbum: getAlbum
+  description: 'TIDAL animated album artwork resolved through track ISRCs.',
+  getAnimatedArtwork: getAnimatedArtwork,
+  getAnimatedArtistArtwork: getAnimatedArtistArtwork
 };
