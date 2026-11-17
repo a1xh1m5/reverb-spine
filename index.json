@@ -1,14 +1,14 @@
 {
   "category:modules": [ 
 	  {
-      "id": "reverb",
-      "name": "reverb",
-      "download": "reverb.8spine",
-      "version": "v1.0.0",
+      "id": "lumen",
+      "name": "lumen",
+      "download": "lumen.8spine",
+      "version": "v1.0.1",
       "type": "MODULE",
-      "author": "xander12",
+      "author": "alx12",
       "description": "Tidal module w/ Dolby Support",
-      "tags": ["HI-RES", "DOBLY ATMOS", "TIDAL", "APPLE MUSIC"],
+      "tags": ["HI-RES", "DOBLY ATMOS", "TIDAL", "ISRC-RESOLUTION"],
       "featured": true,
       "trusted": true
     }
